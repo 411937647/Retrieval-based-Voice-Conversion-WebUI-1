@@ -1,3 +1,4 @@
+import os
 import traceback
 from time import time as ttime
 import faiss
@@ -8,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
+from infer import hubert
 from infer.hubert import extract_hubert_features, load_hubert_model
 from i18n.i18n import I18nAuto
 from tools.cuda_graph import run_cuda_graph
@@ -21,6 +23,23 @@ def printt(strr, *args):
         print(strr)
     else:
         print(strr % args)
+
+
+def read_index(index_path):
+    """读取 faiss 索引并显式设置 nprobe。
+
+    nprobe 会随索引文件持久化，而 train_index.py 建索引时写死为 1（文件名里的
+    nprobe_1 即由此而来）。10 万级向量 / 2600 聚类的 IVF 索引在 nprobe=1 时
+    每次只扫约 39 条向量，recall@8 只有约 0.5，检索基本失效。
+    可用环境变量 RVC_INDEX_NPROBE 覆盖（默认 16）。
+    """
+    index = faiss.read_index(index_path)
+    ivf = faiss.try_extract_index_ivf(index)
+    if ivf is not None:
+        want = int(os.environ.get("RVC_INDEX_NPROBE", 16))
+        ivf.nprobe = max(1, min(want, ivf.nlist))
+        printt(i18n("索引检索：nlist=%d, nprobe=%d"), ivf.nlist, ivf.nprobe)
+    return index
 
 
 def get_synthesizer(pth_path, device=torch.device("cpu")):
@@ -65,6 +84,7 @@ class RVC:
         index_rate,
         config,
         last_rvc=None,
+        hubert_dir=None,
     ) :
         """
         初始化
@@ -76,13 +96,18 @@ class RVC:
             self.device = config.device
             self.f0_up_key = key
             self.formant_shift = formant
+            # 模型内嵌的说话人 id（emb_g），0 为默认音色；可用 change_sid 热切换
+            self.spk_id = 0
+            self.n_spk = 1
+            # 清辅音保护：0=最强保护，0.5=关闭（与离线 pipeline 的 protect 语义一致）
+            self.protect = 0.33
             self.f0_min = 50
             self.f0_max = 1100
             self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
             self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
             self.is_half = config.is_half
             if index_rate != 0:
-                self.index = faiss.read_index(index_path)
+                self.index = read_index(index_path)
                 self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
                 printt(i18n("已启用索引检索"))
             self.pth_path = pth_path
@@ -98,10 +123,26 @@ class RVC:
 
             self.resample_kernel = {}
 
-            if last_rvc is None:
-                self.model = load_hubert_model(self.device, self.is_half)
-            else:
+            # hubert 特征提取器目录：默认官方转换版；切到 assets/hubert_chinese
+            # 即"中文耳朵"。目录与上次一致时直接复用已加载的模型（省显存与时间）。
+            self.hubert_dir = hubert_dir or ""
+            if (
+                last_rvc is not None
+                and getattr(last_rvc, "hubert_dir", "") == self.hubert_dir
+                and hasattr(last_rvc, "model")
+                and last_rvc.model is not None
+            ):
                 self.model = last_rvc.model
+                self.hubert_norm = last_rvc.hubert_norm
+            else:
+                if self.hubert_dir:
+                    hubert.set_hubert_path(self.hubert_dir)
+                self.hubert_norm = hubert.hubert_audio_requires_normalization(
+                    self.hubert_dir or None
+                )
+                self.model = load_hubert_model(
+                    self.device, self.is_half, self.hubert_dir or None
+                )
 
             self.net_g = None
 
@@ -109,6 +150,7 @@ class RVC:
                 self.net_g, cpt = get_synthesizer(self.pth_path, self.device)
                 self.tgt_sr = cpt["config"][-1]
                 cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
+                self.n_spk = cpt["config"][-3]
                 self.if_f0 = cpt.get("f0", 1)
                 self.version = cpt.get("version", "v1")
                 if self.is_half:
@@ -123,6 +165,7 @@ class RVC:
                 self.if_f0 = last_rvc.if_f0
                 self.version = last_rvc.version
                 self.is_half = last_rvc.is_half
+                self.n_spk = last_rvc.n_spk
                 self.net_g = last_rvc.net_g
 
             if last_rvc is not None and hasattr(last_rvc, "model_rmvpe"):
@@ -135,12 +178,40 @@ class RVC:
     def change_key(self, new_key):
         self.f0_up_key = new_key
 
+    def change_sid(self, new_sid):
+        """切换模型内嵌的说话人 id。
+
+        sid 会作为张量输入传给 net_g.infer，CUDA Graph 每次会把输入拷贝进
+        静态缓冲，因此热更新不需要重新捕获图。
+        """
+        self.spk_id = max(0, min(int(new_sid), self.n_spk - 1))
+        return self.spk_id
+
     def change_formant(self, new_formant):
         self.formant_shift = new_formant
 
+    def change_protect(self, new_protect):
+        """设置清辅音保护强度（0=最强，0.5=关闭）。"""
+        self.protect = max(0.0, min(float(new_protect), 0.5))
+        return self.protect
+
+    def preload_index(self):
+        """启动时预读索引，避免变声中把 index_rate 从 0 拖起来时卡一次。
+
+        索引 10 万条 × 768 维，reconstruct_n 需要额外约 300MB 主机内存。
+        """
+        if hasattr(self, "index"):
+            return False
+        if not self.index_path or not os.path.isfile(self.index_path):
+            return False
+        self.index = read_index(self.index_path)
+        self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
+        printt(i18n("索引已预载入内存"))
+        return True
+
     def change_index_rate(self, new_index_rate):
-        if new_index_rate != 0 and self.index_rate == 0:
-            self.index = faiss.read_index(self.index_path)
+        if new_index_rate != 0 and not hasattr(self, "index"):
+            self.index = read_index(self.index_path)
             self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
             printt(i18n("已启用索引检索"))
         self.index_rate = new_index_rate
@@ -244,14 +315,21 @@ class RVC:
                 feats,
                 self.version,
                 padding_mask=padding_mask,
+                normalize=self.hubert_norm,
             )
             feats = torch.cat((feats, feats[:, -1:, :]), 1)
+            # protect 开启时先留一份未做索引混合的特征，用于后面按浊音掩码混回
+            feats0 = feats.clone() if self.protect < 0.5 else None
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
                 npy = feats[0][skip_head // 2 :].cpu().numpy().astype("float32")
                 score, ix = self.index.search(npy, k=8)
                 if (ix >= 0).all():
+                    # score 恰为 0（查询向量与索引内某条完全重合）时 1/score 为 inf，
+                    # 归一化后整行变 NaN，且会经 sola_buffer 永久污染后续输出，
+                    # 这里先做下限保护。
+                    score = np.maximum(score, 1e-6)
                     weight = np.square(1 / score)
                     weight /= weight.sum(axis=1, keepdims=True)
                     npy = np.sum(
@@ -297,8 +375,22 @@ class RVC:
         t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         feats = feats[:, :p_len, :]
+        # 清辅音保护：清辅音帧（pitchf<=0）按 protect 比例保留原始特征，
+        # 避免 index 混合把 s/sh/f/t/k 抹平成"四→是"。
+        # 与离线 infer/vc/pipeline.py:206-212 同一套逻辑，只是掩码取缓存后的 f0。
+        if self.protect < 0.5 and feats0 is not None and self.if_f0 == 1:
+            feats0 = F.interpolate(
+                feats0.permute(0, 2, 1), scale_factor=2
+            ).permute(0, 2, 1)
+            feats0 = feats0[:, :p_len, :]
+            pitchff = cache_pitchf.clone()
+            pitchff[pitchff > 0] = 1
+            pitchff[pitchff < 1] = self.protect
+            pitchff = pitchff.unsqueeze(-1)
+            feats = feats * pitchff + feats0 * (1 - pitchff)
+            feats = feats.to(feats0.dtype)
         p_len_tensor = torch.LongTensor([p_len]).to(self.device)
-        sid = torch.LongTensor([0]).to(self.device)
+        sid = torch.LongTensor([int(self.spk_id)]).to(self.device)
         skip_head_value = int(skip_head)
         return_length_value = int(return_length)
         return_length2_value = int(return_length2)

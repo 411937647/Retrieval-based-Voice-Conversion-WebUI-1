@@ -93,6 +93,8 @@ def extract_hubert_features(model, source, version, padding_mask=None):
             return run_cuda_graph(model, "hubert-v1-no-mask", forward, source)
 
         def forward(input_values, mask):
+            if normalize:
+                input_values = _normalize_input(input_values)
             outputs = model(
                 input_values=input_values,
                 attention_mask=mask,
@@ -107,6 +109,8 @@ def extract_hubert_features(model, source, version, padding_mask=None):
 
     if attention_mask is None:
         def forward(input_values):
+            if normalize:
+                input_values = _normalize_input(input_values)
             return model(
                 input_values=input_values,
                 attention_mask=None,
@@ -117,6 +121,8 @@ def extract_hubert_features(model, source, version, padding_mask=None):
         return run_cuda_graph(model, "hubert-v2-no-mask", forward, source)
 
     def forward(input_values, mask):
+        if normalize:
+            input_values = _normalize_input(input_values)
         return model(
             input_values=input_values,
             attention_mask=mask,

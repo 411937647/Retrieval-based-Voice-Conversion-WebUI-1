@@ -122,11 +122,6 @@ class Pipeline(object):
                 threshold=0.006,
             ).squeeze().detach().cpu().numpy()
 
-        try:
-            uv = f0 == 0
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
-        except Exception:
-            traceback.print_exc()
         f0 *= pow(2, f0_up_key / 12)
         f0bak = f0.copy()
         f0_mel = 1127 * np.log(1 + f0 / 700)
@@ -152,6 +147,7 @@ class Pipeline(object):
         index_rate,
         version,
         protect,
+        normalize=False,
     ):
         feats = torch.from_numpy(audio0)
         if self.is_half:
@@ -171,6 +167,7 @@ class Pipeline(object):
                 feats.to(self.device),
                 version,
                 padding_mask=padding_mask,
+                normalize=normalize,
             )
         if protect < 0.5 and pitch is not None and pitchf is not None:
             feats0 = feats.clone()
@@ -269,6 +266,7 @@ class Pipeline(object):
         rms_mix_rate,
         version,
         protect,
+        normalize=False,
     ):
         if (
             file_index != ""
@@ -338,6 +336,7 @@ class Pipeline(object):
                         index_rate,
                         version,
                         protect,
+                        normalize,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
             else:
@@ -355,6 +354,7 @@ class Pipeline(object):
                         index_rate,
                         version,
                         protect,
+                        normalize,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
             s = t
@@ -373,6 +373,7 @@ class Pipeline(object):
                     index_rate,
                     version,
                     protect,
+                    normalize,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         else:
@@ -390,6 +391,7 @@ class Pipeline(object):
                     index_rate,
                     version,
                     protect,
+                    normalize,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         audio_opt = np.concatenate(audio_opt)
